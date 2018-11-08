@@ -69,7 +69,7 @@ def init_gym(env_name):
     return env, obs_dim, act_dim
 
 
-def run_episode(env, policy, scaler, animate=False):
+def run_episode(env, policys, scaler, action_dim, timesteps, animate=False):
     """ Run single episode with option to animate
 
     Args:
@@ -86,7 +86,11 @@ def run_episode(env, policy, scaler, animate=False):
         unscaled_obs: useful for training scaler, shape = (episode len, obs_dim)
     """
     obs = env.reset()
-    observes, actions, rewards, unscaled_obs = [], [], [], []
+    observes, actions, rewards,  intents, act_trajs = [[] for i range(len(obs))], 
+                          [[] for i range(len(obs))], [[] for i range(len(obs))], 
+                          [[] for i range(len(obs))], [[] for i range(len(obs))]
+    act_traj = [collections.deque(np.zeros(( timesteps, action_dim)), 
+                maxlen = arglist.timestep) for _ in range(len(obs))]
     done = False
     step = 0.0
     scale, offset = scaler.get()
@@ -95,24 +99,32 @@ def run_episode(env, policy, scaler, animate=False):
     while not done:
         if animate:
             env.render()
-        obs = obs.astype(np.float32).reshape((1, -1))
-        obs = np.append(obs, [[step]], axis=1)  # add time step feature
-        unscaled_obs.append(obs)
-        obs = (obs - offset) * scale  # center and scale observations
-        observes.append(obs)
-        action = policy.sample(obs).reshape((1, -1)).astype(np.float32)
-        actions.append(action)
-        obs, reward, done, _ = env.step(np.squeeze(action, axis=0))
-        if not isinstance(reward, float):
-            reward = np.asscalar(np.asarray(reward))
-        rewards.append(reward)
+        # obs = obs.astype(np.float32).reshape((1, -1))
+        # obs = np.append(obs, [[step]], axis=1)  # add time step feature
+        # unscaled_obs.append(obs)
+        # obs = (obs - offset) * scale  # center and scale observations
+        # observes.append(obs)
+        # observes = [observes[i].append(obs[i]) for i in range(len(obs)) ]
+        for i, policy in enumerate(policys):
+            intent = policy.sample_intent(act_traj[i].reshape(1, -1).astype(np.float32))
+            action = policy.sample_action(obs[i], intent).reshape((1, -1)).astype(np.float32)
+            observes[i].append(obs[i])
+            actions[i].append(action)
+            intents[i].append(intent)
+            act_trajs.append(act_traj[i])
+
+        obs, reward, done, _ = env.step(np.squeeze([action[-1] for action in actions], axis=0))
+        for i in range(len(policys)):
+            if not isinstance(reward[i], float):
+                reward[i] = np.asscalar(np.asarray(reward[i]))
+            rewards[i].append(reward[i])
         step += 1e-3  # increment time step feature
 
-    return (np.concatenate(observes), np.concatenate(actions),
-            np.array(rewards, dtype=np.float64), np.concatenate(unscaled_obs))
+    return (observes, actions,np.array(rewards, dtype=np.float64),
+            intents, act_trajs)
 
 
-def run_policy(env, policy, scaler, logger, episodes):
+def run_policy(env, policys, scaler, logger, action_dim, timesteps, episodes):
     """ Run policy and collect data for a minimum of min_steps and min_episodes
 
     Args:
@@ -132,15 +144,16 @@ def run_policy(env, policy, scaler, logger, episodes):
     total_steps = 0
     trajectories = []
     for e in range(episodes):
-        observes, actions, rewards, unscaled_obs = run_episode(env, policy, scaler)
-        total_steps += observes.shape[0]
+        observes, actions, rewards, intents, act_trajs = run_episode(env, policys, scaler, action_dim, timesteps)
+        total_steps += observes.shape[0][0]
         trajectory = {'observes': observes,
                       'actions': actions,
                       'rewards': rewards,
-                      'unscaled_obs': unscaled_obs}
+                      'intents': intents,
+                      'act_trajs': act_trajs}
         trajectories.append(trajectory)
-    unscaled = np.concatenate([t['unscaled_obs'] for t in trajectories])
-    scaler.update(unscaled)  # update running statistics for scaling observations
+    
+   
     logger.log({'_MeanReward': np.mean([t['rewards'].sum() for t in trajectories]),
                 'Steps': total_steps})
 
@@ -184,7 +197,8 @@ def add_value(trajectories, val_func):
     """
     for trajectory in trajectories:
         observes = trajectory['observes']
-        values = val_func.predict(observes)
+        intents = trajectory['intents']
+        values = [val_func.predict(np.concatenate([obs, intents])) for obs, intent in zip(observes, intents)]
         trajectory['values'] = values
 
 
@@ -205,13 +219,13 @@ def add_gae(trajectories, gamma, lam):
     """
     for trajectory in trajectories:
         if gamma < 0.999:  # don't scale for gamma ~= 1
-            rewards = trajectory['rewards'] * (1 - gamma)
+            rewards = [t['rewards'] * (1 - gamma) for t in trajectory]
         else:
             rewards = trajectory['rewards']
         values = trajectory['values']
         # temporal differences
-        tds = rewards - values + np.append(values[1:] * gamma, 0)
-        advantages = discount(tds, gamma * lam)
+        tds = [reward - value + np.append(value[1:] * gamma, 0) for reward, value in zip(rewards, values)]
+        advantages = [discount(t, gamma * lam) for t in tds]
         trajectory['advantages'] = advantages
 
 
@@ -228,14 +242,16 @@ def build_train_set(trajectories):
         advantages: shape = (N,)
         disc_sum_rew: shape = (N,)
     """
-    observes = np.concatenate([t['observes'] for t in trajectories])
-    actions = np.concatenate([t['actions'] for t in trajectories])
-    disc_sum_rew = np.concatenate([t['disc_sum_rew'] for t in trajectories])
-    advantages = np.concatenate([t['advantages'] for t in trajectories])
+    observes = [np.concatenate([t['observes'] for t in traj]) for traj in trajectories]
+    actions = [np.concatenate([t['actions'] for t in traj]) for traj in trajectories ]
+    intents = [np.concatenate([t['intents'] for t in traj]) for traj in trajectories]
+    act_trajs = [np.concatenate([t['act_trajs']] for t in traj) for traj in trajectories]
+    disc_sum_rew = [np.concatenate([t['disc_sum_rew'] for t in traj] for traj in trajectories)]
+    advantages = [np.concatenate([t['advantages'] for t in traj] for traj in trajectories)]
     # normalize advantages
-    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
+    advantages = [(adv - adv.mean()) / (adv.std() + 1e-6) for adv in advantages]
 
-    return observes, actions, advantages, disc_sum_rew
+    return observes, actions, intents, act_trajs,  advantages, disc_sum_rew
 
 
 def log_batch_stats(observes, actions, advantages, disc_sum_rew, logger, episode):
@@ -248,6 +264,14 @@ def log_batch_stats(observes, actions, advantages, disc_sum_rew, logger, episode
                 '_min_act': np.min(actions),
                 '_max_act': np.max(actions),
                 '_std_act': np.mean(np.var(actions, axis=0)),
+                '_mean_intent': np.mean(intents),
+                '_min_intent': np.min(intents),
+                '_max_intent': np.max(intents),
+                '_std_intent': np.mean(np.var(intents, axis=0)),
+                '_mean_act_traj': np.mean(act_trajs),
+                '_min_act_traj': np.min(act_trajs),
+                '_max_act_traj': np.max(act_trajs),
+                '_std_act_traj': np.mean(np.var(act_trajs, axis=0)),
                 '_mean_adv': np.mean(advantages),
                 '_min_adv': np.min(advantages),
                 '_max_adv': np.max(advantages),
@@ -260,7 +284,7 @@ def log_batch_stats(observes, actions, advantages, disc_sum_rew, logger, episode
                 })
 
 
-def main(env_name, num_episodes, gamma, lam, kl_targ, batch_size, hid1_mult, policy_logvar):
+def main(env_name, num_episodes, num_agents, act_traj_len, gamma, lam, kl_targ, batch_size, hid1_mult, policy_logvar, num_agents, action_dim, timesteps):
     """ Main training loop
 
     Args:
@@ -282,12 +306,15 @@ def main(env_name, num_episodes, gamma, lam, kl_targ, batch_size, hid1_mult, pol
     env = wrappers.Monitor(env, aigym_path, force=True)
     scaler = Scaler(obs_dim)
     val_func = NNValueFunction(obs_dim, hid1_mult)
-    policy = Policy(obs_dim, act_dim, kl_targ, hid1_mult, policy_logvar)
+    policys = []
+
+    for i in range(num_agents):
+        policys.append(Policy(i, obs_dim, act_dim, kl_targ, hid1_mult, policy_logvar, num_agents-1, act_traj_len))
     # run a few episodes of untrained policy to initialize scaler:
-    run_policy(env, policy, scaler, logger, episodes=5)
+    run_policy(env, policys, scaler, logger, episodes=5, params = params)
     episode = 0
     while episode < num_episodes:
-        trajectories = run_policy(env, policy, scaler, logger, episodes=batch_size)
+        trajectories = run_policy(env, policy, scaler, logger, num_agents, timesteps, episodes=batch_size)
         episode += len(trajectories)
         add_value(trajectories, val_func)  # add estimated values to episodes
         add_disc_sum_rew(trajectories, gamma)  # calculated discounted sum of Rs
@@ -296,15 +323,17 @@ def main(env_name, num_episodes, gamma, lam, kl_targ, batch_size, hid1_mult, pol
         observes, actions, advantages, disc_sum_rew = build_train_set(trajectories)
         # add various stats to training log:
         log_batch_stats(observes, actions, advantages, disc_sum_rew, logger, episode)
-        policy.update(observes, actions, advantages, logger)  # update policy
-        val_func.fit(observes, disc_sum_rew, logger)  # update value function
+        for i, policy in enumerate(policys):
+            policy.update(observes[i], actions[i], advantages[i], logger)  # update policy
+            val_func.fit(observes[i], disc_sum_rew[i], logger)  # update value function
         logger.write(display=True)  # write logger results to file and stdout
         if killer.kill_now:
             if input('Terminate training (y/[n])? ') == 'y':
                 break
             killer.kill_now = False
     logger.close()
-    policy.close_sess()
+    for policy in policys:
+        policy.close_sess()
     val_func.close_sess()
 
 
@@ -329,6 +358,10 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--policy_logvar', type=float,
                         help='Initial policy log-variance (natural log of variance)',
                         default=-1.0)
+    parser.add_argument('--num_agents', type=int, help = "number of agents")
+    parser.add_argument('--action_dim', type = int, help = "action dimension")
+    parser.add_argument('--timesteps', type = int, help = "the max length of the act traj buffer")
+
 
     args = parser.parse_args()
     main(**vars(args))
